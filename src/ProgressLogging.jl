@@ -35,10 +35,6 @@ end
 
 const ProgressLevel = LogLevel(-1)
 
-# Constants for thread-safe progress tracking
-const PROGRESS_SAMPLE_FREQUENCY = 100  # Sample every ~1% of iterations
-const MAX_CAS_RETRIES = 10  # Maximum compare-and-swap retry attempts
-
 """
     ProgressLogging.ROOTID
 
@@ -419,61 +415,6 @@ _progress(name::Union{AbstractString,Expr}, ex) = _progress(name, 0.005, ex)
 _progress(thresh::Real, ex) = _progress("", thresh, ex)
 
 function _progress(name, thresh, ex)
-    # Check if this is a Threads.@threads macro call
-    if ex.head == :macrocall
-        # Check various forms of @threads macro
-        macro_name = ex.args[1]
-        is_threads = false
-        
-        if macro_name == Symbol("@threads")
-            is_threads = true
-        elseif macro_name == :(Threads.var"@threads")
-            is_threads = true
-        elseif macro_name isa Expr && macro_name.head == :.
-            # Handle Base.Threads.@threads or similar
-            if length(macro_name.args) == 2
-                # Check if it ends with @threads
-                if macro_name.args[2] == QuoteNode(Symbol("@threads"))
-                    is_threads = true
-                end
-            end
-        end
-        
-        if is_threads
-            # Extract the for loop from the @threads macro
-            # @threads has the form: @threads [scheduler] for_loop
-            # We need to find the for loop in the args
-            forloop_idx = findfirst(a -> a isa Expr && a.head == :for, ex.args)
-            if forloop_idx === nothing
-                error("@progress Threads.@threads requires a for loop")
-            end
-            forloop = ex.args[forloop_idx]
-            
-            # Parse the for loop
-            if forloop.args[1].head == Symbol("=") && forloop.args[2].head == :block
-                # single-variable for: for <iter_var> = <range>; <body> end
-                target = :_
-                result = :nothing
-                iter_vars = [forloop.args[1].args[1]]
-                ranges = [forloop.args[1].args[2]]
-                body = forloop.args[2]
-            elseif forloop.args[1].head == :block && forloop.args[2].head == :block
-                # multi-variable for: for <iter_var> = <range>,...; <body> end
-                target = :_
-                result = :nothing
-                # iter_vars and ranges are ordered from inner loop to outer loop
-                iter_vars = reverse([e.args[1] for e in forloop.args[1].args])
-                ranges = reverse([e.args[2] for e in forloop.args[1].args])
-                body = forloop.args[2]
-            else
-                error("@progress Threads.@threads requires a valid for loop")
-            end
-            
-            # Return a thread-safe version
-            return _progress_threaded(name, thresh, ex, target, result, iter_vars, ranges, body, forloop_idx)
-        end
-    end
-    
     if ex.head == Symbol("=") &&
        ex.args[2].head == :comprehension && ex.args[2].args[1].head == :generator
         # comprehension: <target> = [<body> for <iter_var> in <range>,...]
@@ -517,76 +458,36 @@ function _progress(name, thresh, ex, target, result, loop, iter_vars, ranges, bo
         iter_vars,
         ranges,
     )]
-    @gensym count_to_frac val frac lastfrac
+    @gensym count_to_frac val frac lastfrac_atomic lastfrac_local
     m = @__MODULE__
     quote
         $target = $m.@withprogress name = $name begin
             $count_to_frac = $make_count_to_frac($(ranges...))
-            $lastfrac = 0.0
+            $lastfrac_atomic = $Base.Threads.Atomic{Float64}(0.0)
 
             $(loop(
                 iter_exprs,
                 quote
                     $val = $body
                     $frac = $count_to_frac($(count_vars...))
-                    if $frac - $lastfrac > $thresh
-                        $m.@logprogress $frac
-                        $lastfrac = $frac
+                    $lastfrac_local = $lastfrac_atomic[]
+                    if $frac - $lastfrac_local > $thresh
+                        # Try to update lastfrac atomically using compare-and-swap
+                        while true
+                            $lastfrac_local = $lastfrac_atomic[]
+                            if $frac - $lastfrac_local > $thresh
+                                if $Base.Threads.atomic_cas!($lastfrac_atomic, $lastfrac_local, $frac) == $lastfrac_local
+                                    $m.@logprogress $frac
+                                    break
+                                end
+                            else
+                                break
+                            end
+                        end
                     end
                     $val
                 end,
             ))
-        end
-        $result
-    end
-end
-
-function _progress_threaded(name, thresh, ex, target, result, iter_vars, ranges, body, forloop_idx)
-    # For threaded loops, we need atomic operations for thread-safe progress tracking
-    @gensym val frac lastfrac_atomic counter_atomic N lastfrac_local retry_count count
-    m = @__MODULE__
-    
-    # Reconstruct the @threads macro call with our modified body
-    new_forloop = Expr(:for, ex.args[forloop_idx].args[1], quote
-        $val = $body
-        # Atomically increment counter and get new count
-        # Note: atomic_add! returns the old value, so we add 1 to get the new count
-        $count = $Base.Threads.atomic_add!($counter_atomic, 1) + 1
-        # Only compute fraction if we might need to log
-        # Sample every ~1% of iterations to reduce overhead
-        if $count % max(1, div($N, $PROGRESS_SAMPLE_FREQUENCY)) == 0 || $count == $N
-            $frac = $count / $N
-            $lastfrac_local = $lastfrac_atomic[]
-            if $frac - $lastfrac_local > $thresh
-                # Try to update lastfrac atomically with bounded retries
-                $retry_count = 0
-                while $retry_count < $MAX_CAS_RETRIES
-                    $lastfrac_local = $lastfrac_atomic[]
-                    if $frac - $lastfrac_local > $thresh
-                        if $Base.Threads.atomic_cas!($lastfrac_atomic, $lastfrac_local, $frac) == $lastfrac_local
-                            $m.@logprogress $frac
-                            break
-                        end
-                        $retry_count += 1
-                    else
-                        break
-                    end
-                end
-            end
-        end
-        $val
-    end)
-    
-    # Reconstruct the full @threads expression
-    new_threads_expr = Expr(:macrocall, ex.args[1:forloop_idx-1]..., new_forloop, ex.args[forloop_idx+1:end]...)
-    
-    quote
-        $target = $m.@withprogress name = $name begin
-            $N = $prod($map($length, ($(ranges...),)))
-            $counter_atomic = $Base.Threads.Atomic{Int}(0)
-            $lastfrac_atomic = $Base.Threads.Atomic{Float64}(0.0)
-            
-            $new_threads_expr
         end
         $result
     end
