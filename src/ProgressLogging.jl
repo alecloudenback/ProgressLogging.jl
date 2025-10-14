@@ -458,21 +458,32 @@ function _progress(name, thresh, ex, target, result, loop, iter_vars, ranges, bo
         iter_vars,
         ranges,
     )]
-    @gensym count_to_frac val frac lastfrac
+    @gensym count_to_frac val frac lastfrac_atomic lastfrac_local
     m = @__MODULE__
     quote
         $target = $m.@withprogress name = $name begin
             $count_to_frac = $make_count_to_frac($(ranges...))
-            $lastfrac = 0.0
+            $lastfrac_atomic = $Base.Threads.Atomic{Float64}(0.0)
 
             $(loop(
                 iter_exprs,
                 quote
                     $val = $body
                     $frac = $count_to_frac($(count_vars...))
-                    if $frac - $lastfrac > $thresh
-                        $m.@logprogress $frac
-                        $lastfrac = $frac
+                    $lastfrac_local = $lastfrac_atomic[]
+                    if $frac - $lastfrac_local > $thresh
+                        # Try to update lastfrac atomically using compare-and-swap
+                        while true
+                            $lastfrac_local = $lastfrac_atomic[]
+                            if $frac - $lastfrac_local > $thresh
+                                if $Base.Threads.atomic_cas!($lastfrac_atomic, $lastfrac_local, $frac) == $lastfrac_local
+                                    $m.@logprogress $frac
+                                    break
+                                end
+                            else
+                                break
+                            end
+                        end
                     end
                     $val
                 end,
