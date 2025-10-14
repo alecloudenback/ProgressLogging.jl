@@ -35,6 +35,10 @@ end
 
 const ProgressLevel = LogLevel(-1)
 
+# Constants for thread-safe progress tracking
+const PROGRESS_SAMPLE_FREQUENCY = 100  # Sample every ~1% of iterations
+const MAX_CAS_RETRIES = 10  # Maximum compare-and-swap retry attempts
+
 """
     ProgressLogging.ROOTID
 
@@ -545,17 +549,18 @@ function _progress_threaded(name, thresh, ex, target, result, iter_vars, ranges,
     # Reconstruct the @threads macro call with our modified body
     new_forloop = Expr(:for, ex.args[forloop_idx].args[1], quote
         $val = $body
-        # Atomically increment counter
+        # Atomically increment counter and get new count
+        # Note: atomic_add! returns the old value, so we add 1 to get the new count
         $count = $Base.Threads.atomic_add!($counter_atomic, 1) + 1
         # Only compute fraction if we might need to log
-        # Sample every few iterations to reduce overhead
-        if $count % max(1, div($N, 100)) == 0 || $count == $N
+        # Sample every ~1% of iterations to reduce overhead
+        if $count % max(1, div($N, $PROGRESS_SAMPLE_FREQUENCY)) == 0 || $count == $N
             $frac = $count / $N
             $lastfrac_local = $lastfrac_atomic[]
             if $frac - $lastfrac_local > $thresh
                 # Try to update lastfrac atomically with bounded retries
                 $retry_count = 0
-                while $retry_count < 10
+                while $retry_count < $MAX_CAS_RETRIES
                     $lastfrac_local = $lastfrac_atomic[]
                     if $frac - $lastfrac_local > $thresh
                         if $Base.Threads.atomic_cas!($lastfrac_atomic, $lastfrac_local, $frac) == $lastfrac_local
