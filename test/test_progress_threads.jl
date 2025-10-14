@@ -7,13 +7,13 @@ using Base.Threads
 
 @testset "@progress with Threads.@threads" begin
     # Test basic threaded loop
-    let result = []
+    let counter = Threads.Atomic{Int}(0)
         logs, = collect_test_logs(min_level = ProgressLevel) do
             @progress Threads.@threads for i = 1:10
-                push!(result, i)
+                Threads.atomic_add!(counter, 1)
             end
         end
-        @test sort(result) == 1:10
+        @test counter[] == 10
         # Should have logged at least start (nothing) and done
         @test length(logs) >= 2
         @test logs[1].kwargs[:progress] === nothing

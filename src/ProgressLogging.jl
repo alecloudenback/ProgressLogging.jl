@@ -539,28 +539,33 @@ end
 
 function _progress_threaded(name, thresh, ex, target, result, iter_vars, ranges, body, forloop_idx)
     # For threaded loops, we need atomic operations for thread-safe progress tracking
-    @gensym val frac lastfrac_atomic counter_atomic N lastfrac_local
+    @gensym val frac lastfrac_atomic counter_atomic N lastfrac_local retry_count count
     m = @__MODULE__
     
     # Reconstruct the @threads macro call with our modified body
     new_forloop = Expr(:for, ex.args[forloop_idx].args[1], quote
         $val = $body
         # Atomically increment counter
-        $Base.Threads.atomic_add!($counter_atomic, 1)
-        $frac = $counter_atomic[] / $N
-        # Thread-safe check if we should log progress
-        $lastfrac_local = $lastfrac_atomic[]
-        if $frac - $lastfrac_local > $thresh
-            # Try to update lastfrac atomically
-            while true
-                $lastfrac_local = $lastfrac_atomic[]
-                if $frac - $lastfrac_local > $thresh
-                    if $Base.Threads.atomic_cas!($lastfrac_atomic, $lastfrac_local, $frac) == $lastfrac_local
-                        $m.@logprogress $frac
+        $count = $Base.Threads.atomic_add!($counter_atomic, 1) + 1
+        # Only compute fraction if we might need to log
+        # Sample every few iterations to reduce overhead
+        if $count % max(1, div($N, 100)) == 0 || $count == $N
+            $frac = $count / $N
+            $lastfrac_local = $lastfrac_atomic[]
+            if $frac - $lastfrac_local > $thresh
+                # Try to update lastfrac atomically with bounded retries
+                $retry_count = 0
+                while $retry_count < 10
+                    $lastfrac_local = $lastfrac_atomic[]
+                    if $frac - $lastfrac_local > $thresh
+                        if $Base.Threads.atomic_cas!($lastfrac_atomic, $lastfrac_local, $frac) == $lastfrac_local
+                            $m.@logprogress $frac
+                            break
+                        end
+                        $retry_count += 1
+                    else
                         break
                     end
-                else
-                    break
                 end
             end
         end
